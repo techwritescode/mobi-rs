@@ -1,0 +1,3 @@
+[workspace]
+resolver = "3"
+members = ["crates/byyte", "crates/mobi", "crates/palm_database"]
