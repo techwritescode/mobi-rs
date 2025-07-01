@@ -132,6 +132,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "byyte 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "chrono",
  "palm_database",
  "palmdoc-compression",
 ]

@@ -1,6 +1,5 @@
 use std::io::Seek;
-use chrono::Local;
-use crate::bytes::ByteReader;
+use byyte::be::ByteReader;
 
 #[derive(Debug, Clone)]
 pub struct PalmDOCHeader {
@@ -66,7 +65,7 @@ pub struct MOBIHeader {
 
 impl MOBIHeader {
     pub fn new<R: std::io::Read + std::io::Seek>(reader: &mut R) -> std::io::Result<Self> {
-        let identifier = reader.read_string(4)?;
+        let identifier = reader.read_cstr(4)?;
         let header_length = reader.read_u32()?;
         let mobi_type = reader.read_u32()?;
         let text_encoding = reader.read_u32()?;
