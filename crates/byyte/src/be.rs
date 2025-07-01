@@ -79,13 +79,6 @@ pub trait ByteWriter: io::Write {
     fn write_f64(&mut self, value: f64) -> Result<()> {
         self.write_all(&value.to_be_bytes())
     }
-
-    fn write_cstr(&mut self, string: &str) -> Result<()> {
-        let bytes = string.as_bytes();
-        let mut buf = bytes.to_vec();
-        buf.push(0); // Null-terminate
-        self.write_all(&buf)
-    }
 }
 
 impl<W: io::Write + ?Sized> ByteWriter for W {}
