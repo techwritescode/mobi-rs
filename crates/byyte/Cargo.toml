@@ -1,6 +1,6 @@
 [package]
 name = "byyte"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A library for reading and writing binary data, focusing on simplicity."
 license = "MIT"
