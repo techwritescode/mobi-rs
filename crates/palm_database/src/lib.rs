@@ -1,5 +1,5 @@
 use std::io::{Seek, Error, ErrorKind};
-use byyte::ByteReader;
+use byyte::be::ByteReader;
 
 pub fn parse_palm_timestamp(timestamp: u32) -> Result<chrono::NaiveDateTime, Error> {
     let seconds = timestamp as i64;
@@ -30,7 +30,7 @@ pub struct PDBHeader {
 
 impl PDBHeader {
     pub fn new<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let name = reader.read_string(32)?;
+        let name = reader.read_cstr(32)?;
 
         let attributes = reader.read_u16()?;
         let version = reader.read_u16()?;
@@ -40,8 +40,8 @@ impl PDBHeader {
         let modification_number = reader.read_u32()?;
         let app_info_id = reader.read_u32()?;
         let sort_info_id = reader.read_u32()?;
-        let type_ = reader.read_string(4)?;
-        let creator = reader.read_string(4)?;
+        let type_ = reader.read_cstr(4)?;
+        let creator = reader.read_cstr(4)?;
         let unique_id_seed = reader.read_u32()?;
         let next_record_list_id = reader.read_u32()?;
         let number_of_records = reader.read_u16()?;
