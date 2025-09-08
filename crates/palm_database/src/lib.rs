@@ -1,9 +1,9 @@
-mod builder;
-mod timestamp;
+pub mod builder;
+pub mod timestamp;
 
-use std::io::{Seek, Error, ErrorKind, Read, SeekFrom, Write};
-use byyte::be::{ByteReader, ByteWriter};
 use crate::timestamp::to_palm_timestamp;
+use byyte::be::{ByteReader, ByteWriter};
+use std::io::{Error, ErrorKind, Read, Seek, SeekFrom, Write};
 
 pub fn parse_palm_timestamp(timestamp: u32) -> Result<chrono::NaiveDateTime, Error> {
     let seconds = timestamp as i64;
@@ -12,7 +12,6 @@ pub fn parse_palm_timestamp(timestamp: u32) -> Result<chrono::NaiveDateTime, Err
         .ok_or(Error::from(ErrorKind::InvalidData))?;
     Ok(epoch + chrono::Duration::seconds(seconds))
 }
-
 
 #[derive(Debug, Clone)]
 pub struct PDBHeader {
@@ -95,27 +94,27 @@ impl PDBHeader {
 
 #[derive(Debug, Clone)]
 pub struct PDBRecord {
-    pub attributes: u8,
-    pub unique_id: [u8; 3],
+    pub data_offset: u32,
+    pub attributes: u32, // First byte is attributes, next 3 are unique ID
 }
 
 impl PDBRecord {
     pub fn from_bytes<R: Read>(reader: &mut R) -> std::io::Result<(Self, u32)> {
         let data_offset = reader.read_u32()?;
-        let attributes = reader.read_u8()?;
-        let mut unique_id = [0u8; 3];
-        reader.read_exact(&mut unique_id)?;
+        let attributes = reader.read_u32()?;
 
-        Ok((PDBRecord {
-            attributes,
-            unique_id,
-        }, data_offset))
+        Ok((
+            PDBRecord {
+                data_offset,
+                attributes,
+            },
+            data_offset,
+        ))
     }
     pub fn to_bytes(&self, data_offset: u32) -> std::io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         bytes.write_u32(data_offset)?;
-        bytes.write_u8(self.attributes)?;
-        bytes.extend_from_slice(&self.unique_id);
+        bytes.write_u32(self.attributes)?;
         Ok(bytes)
     }
 }
@@ -124,12 +123,43 @@ impl PDBRecord {
 pub struct PDB {
     pub header: PDBHeader,
     pub records: Vec<PDBRecord>,
-    pub record_data: Vec<Vec<u8>>
+    pub record_data: Vec<Vec<u8>>,
 }
 
 impl PDB {
+    pub fn new(header: PDBHeader) -> Self {
+        Self {
+            header,
+            records: vec![],
+            record_data: vec![],
+        }
+    }
+
     pub fn read_record(&self, index: u16) -> Option<Vec<u8>> {
         self.record_data.get(index as usize).cloned()
+    }
+
+    pub fn add_record(&mut self, data: Vec<u8>) -> u16 {
+        let id = self.header.unique_id_seed;
+        let data_offset = self
+            .records
+            .last()
+            .unwrap_or(&PDBRecord {
+                data_offset: 0,
+                attributes: 0,
+            })
+            .data_offset
+            + self.record_data.last().unwrap_or(&vec![]).len() as u32;
+        self.records.push(PDBRecord {
+            data_offset,
+            attributes: id,
+        });
+        self.record_data.push(data);
+        self.header.unique_id_seed += 2;
+        self.header.number_of_records += 1;
+
+
+        self.header.number_of_records - 1
     }
 }
 
@@ -137,12 +167,13 @@ impl PDB {
     pub fn from_bytes<R: Read + Seek>(reader: &mut R) -> std::io::Result<Self> {
         let header = PDBHeader::from_bytes(reader)?;
         let mut records = Vec::new();
-        let record_count = records.len();
         let mut record_data = Vec::new();
 
         for _ in 0..header.number_of_records {
             records.push(PDBRecord::from_bytes(reader)?);
         }
+
+        let record_count = records.len();
 
         for (i, (_, data_offset)) in records.iter().cloned().enumerate() {
             let start = data_offset as u64;
@@ -152,7 +183,10 @@ impl PDB {
             } else {
                 let end = reader.seek(SeekFrom::End(0))?;
                 if end < start {
-                    return Err(Error::new(ErrorKind::InvalidData, "Invalid record data offset"));
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Invalid record data offset",
+                    ));
                 }
                 end
             };
@@ -164,7 +198,11 @@ impl PDB {
             record_data.push(data);
         }
 
-        Ok(PDB { header, records: records.iter().map(|(record, _)| record).cloned().collect(), record_data })
+        Ok(PDB {
+            header,
+            records: records.iter().map(|(record, _)| record).cloned().collect(),
+            record_data,
+        })
     }
 
     pub fn to_bytes(&self) -> std::io::Result<Vec<u8>> {
@@ -172,7 +210,10 @@ impl PDB {
         let mut offset: u32 = 78 + self.records.len() as u32 * 8; // Header and records size
         for (i, record) in self.records.iter().enumerate() {
             let data_offset = offset;
-            let data = self.record_data.get(i).ok_or_else(|| Error::new(ErrorKind::InvalidData, "Missing record data"))?;
+            let data = self
+                .record_data
+                .get(i)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Missing record data"))?;
             offset += data.len() as u32;
             bytes.extend_from_slice(&record.to_bytes(data_offset)?);
         }
@@ -185,9 +226,9 @@ impl PDB {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
-    use crate::builder::PDBBuilder;
     use super::*;
+    use crate::builder::PDBBuilder;
+    use std::fs::File;
 
     #[test]
     fn test_pdb_header_to_bytes() {
@@ -207,7 +248,9 @@ mod tests {
             next_record_list_id: 1,
             number_of_records: 0,
         };
-        let bytes = header.to_bytes().expect("Failed to convert header to bytes");
+        let bytes = header
+            .to_bytes()
+            .expect("Failed to convert header to bytes");
         assert_eq!(bytes.len(), 78, "PDB header must be exactly 78 bytes long");
     }
 

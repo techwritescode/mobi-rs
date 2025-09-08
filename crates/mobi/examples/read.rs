@@ -1,38 +1,38 @@
-use std::fs::File;
-use std::io::{Read, Seek, Write};
 use anyhow::anyhow;
-use mobi::mobi::{MOBIHeader, PalmDOCHeader};
+use mobi::mobi::{MOBI, MOBIHeader, PalmDOCHeader};
 use palm_database::PDB;
+use std::fs::File;
+use std::io::{Read, Write};
+use mobi::compression::palmdoc_decompress;
 
 fn main() -> anyhow::Result<()> {
-    let data = std::fs::read("Quick Start Guide - John Schember.mobi")?;
-    let len = data.len() as u32;
-    let mut cursor = std::io::Cursor::new(data);
-
-    let header = PDB::from_bytes(&mut cursor)?;
-
-    let mobi_header = header.read_record(0).ok_or(anyhow!("Failed to read mobi"))?;
-
-    let mut mobi_header_cursor = std::io::Cursor::new(mobi_header);
-    let palmdoc_header = PalmDOCHeader::new(&mut mobi_header_cursor)?;
-    let mobi_header = MOBIHeader::new(&mut mobi_header_cursor)?;
-
-    println!("{:#?}", mobi_header);
-
+    let mut data = File::open("Perfect World - MangaDex.mobi")?;
+    let mobi = MOBI::from_bytes(&mut data)?;
+    eprintln!("{:#?}", mobi.palmdoc_header);
+    eprintln!("{:#?}", mobi.header);
 
     let mut str = Vec::new();
-    for (i, record) in header.records.iter().enumerate().skip(1).take(mobi_header.first_non_book_index as usize - 1) {
-        println!("Record #{}: {:?}", i, record);
-        let record_data = header.read_record(i as u16).ok_or(anyhow!("Failed to read record"))?;
-        let record_data = &record_data[..record_data.len()-2];
+    for i in 1..=mobi.palmdoc_header.record_count
+    {
+        let record_data = mobi.read_record(i)?;
 
         File::create(format!("dump/record_{i}.bin"))?.write_all(&record_data)?;
-        let new_text = palmdoc_compression::decompress(&record_data)?;
-        let processed = new_text.iter().position(|&b| b == 0).map(|i| &new_text[..i]).unwrap_or(&new_text[..]);
-        str.extend_from_slice(processed);
+        let new_text = palmdoc_decompress(&record_data);
+        File::create(format!("dump/record_{i}.txt"))?.write(&new_text)?;
+        str.extend_from_slice(&new_text);
     }
 
-    File::create(format!("dump/record.html"))?.write(String::from_utf8_lossy(&str).as_bytes())?;
+    for i in mobi.palmdoc_header.record_count+1..mobi.header.last_content_record_number {
+        let record_data = mobi.read_record(i)?;
+        File::create(format!("dump/record_{i}.bin"))?.write_all(&record_data)?;
+    }
+
+    for i in mobi.header.last_content_record_number..mobi.pdb.header.number_of_records {
+        let record_data = mobi.pdb.read_record(i).unwrap();
+        File::create(format!("dump/record_{i}.bin"))?.write_all(&record_data)?;
+    }
+
+    File::create("dump/record.html".to_string())?.write(String::from_utf8_lossy(&str).as_bytes())?;
 
     Ok(())
 }

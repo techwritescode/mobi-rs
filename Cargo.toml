@@ -1,3 +1,3 @@
 [workspace]
 resolver = "3"
-members = ["crates/byyte", "crates/mobi", "crates/palm_database"]
+members = ["crates/byyte", "crates/manga2kindle", "crates/mobi", "crates/palm_database"]

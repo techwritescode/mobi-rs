@@ -105,13 +105,7 @@ impl PDBBuilder {
                 next_record_list_id: self.next_record_list_id,
                 number_of_records: self.records.len() as u16,
             },
-            records: self.records.iter().map(|(id, attributes, _)| {
-                let id = id.to_be_bytes();
-                PDBRecord {
-                    unique_id: [id[0], id[1], id[2]],
-                    attributes: *attributes,
-                }
-            }).collect(),
+            records: vec![],
             record_data: self.records.iter().map(|(_, _, data)| data.clone()).collect(),
         })
     }
