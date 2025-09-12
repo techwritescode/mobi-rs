@@ -1,17 +1,34 @@
 use iced::alignment::Horizontal;
-use iced::futures::StreamExt;
+use iced::futures::{stream, StreamExt};
+use iced::widget::button::Status;
 use iced::widget::image::Handle;
 use iced::widget::{
-    button, column, container, horizontal_space, row, scrollable, text, text_input, Column,
+    button, center, column, container, horizontal_space, mouse_area, opaque, progress_bar, row,
+    scrollable, stack, text, text_input, Column,
 };
 use iced::{widget, Background, Color, Element, Length, Padding, Subscription, Task, Theme};
+use iced_aw::card;
+use image::imageops::FilterType;
+use image::{DynamicImage, GenericImageView, ImageFormat};
+use mobi::mobi_writer::MobiWriter;
 use reqwest::Client;
+use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::Arc;
 
 const IMAGE_WIDTH: f32 = 128.0;
 const IMAGE_HEIGHT: f32 = 128.0;
 
 fn main() -> iced::Result {
+    // TODO: Someday
+    // let disks = sysinfo::Disks::new_with_refreshed_list();
+    //
+    // for disk in disks.iter() {
+    //     if disk.name() == "Kindle" && disk.is_removable() {
+    //         eprintln!("Disk: {:?}", disk.mount_point());
+    //     }
+    // }
+
     iced::application::application("Manga2Kindle", App::update, App::view)
         .subscription(App::subscription)
         .theme(|_| Theme::Dark)
@@ -31,6 +48,15 @@ enum Message {
     MangaSelected(MangaListItem),
     Back,
     MangaCoverLoaded(Result<Handle, Error>),
+    MangaChaptersLoaded(Result<Vec<Volume>, Error>),
+    ChapterClicked {
+        volume: String,
+        chapter: String,
+        id: String,
+    },
+    MangaDownloaded(Result<(MangaChapterResponse, (String, String)), Error>),
+    ImageDownloaded(Result<DownloadImage, Error>),
+    DownloadError(Error),
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +65,7 @@ enum Error {
     IOFailed(Arc<std::io::Error>),
     JoinFailed(Arc<tokio::task::JoinError>),
     ImageFailed(Arc<image::ImageError>),
+    GenericError(String),
 }
 
 #[derive(Debug, Clone)]
@@ -64,9 +91,60 @@ pub struct CollectionResponse<T> {
     data: Vec<T>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Chapter {
+    pub id: String,
+    pub volume: String,
+    pub chapter: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Volume {
+    pub name: String,
+    pub chapters: Vec<Chapter>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MangaChapterImages {
+    hash: String,
+    data: Vec<String>,
+    // data_saver: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MangaChapterResponse {
+    #[serde(rename = "baseUrl")]
+    base_url: String,
+    chapter: MangaChapterImages,
+}
+
 pub enum State {
     Search,
     Detail,
+}
+
+struct Download {
+    base_url: String,
+    hash: String,
+
+    volume: String,
+    chapter: String,
+    images: Vec<String>,
+
+    downloaded: usize,
+    total_to_download: usize,
+    downloaded_images: HashMap<String, DownloadImage>,
+}
+
+#[derive(Debug, Clone)]
+struct DownloadImage {
+    name: String,
+    width: u32,
+    height: u32,
+    bytes: Vec<u8>,
 }
 
 struct App {
@@ -75,6 +153,9 @@ struct App {
     results: Vec<MangaListItem>,
     state: State,
     selected_manga: Option<MangaListItem>,
+    volumes: Vec<Volume>,
+
+    active_download: Option<Download>,
 }
 
 impl App {
@@ -86,6 +167,8 @@ impl App {
                 results: Vec::new(),
                 state: State::Search,
                 selected_manga: None,
+                volumes: vec![],
+                active_download: None,
             },
             widget::focus_next(),
         )
@@ -105,7 +188,13 @@ impl App {
                     Self::thumbnail_subscription(self.search_id, urls)
                 }
             }
-            _ => Subscription::none(),
+            State::Detail => {
+                if let Some(response) = &self.active_download {
+                    download_manga_images(response)
+                } else {
+                    Subscription::none()
+                }
+            }
         }
     }
 
@@ -136,15 +225,30 @@ impl App {
                 Task::perform(do_search(self.search.clone()), Message::SearchResults)
             }
             Message::MangaSelected(manga) => {
+                let id = manga.id.clone();
                 let cover_url = manga.cover_url.clone();
                 self.selected_manga = Some(manga);
                 self.state = State::Detail;
-                Task::perform(fetch_image(cover_url), Message::MangaCoverLoaded)
+
+                Task::batch(vec![
+                    Task::perform(load_manga(id), Message::MangaChaptersLoaded),
+                    Task::perform(fetch_image(cover_url), Message::MangaCoverLoaded),
+                ])
             }
             Message::MangaCoverLoaded(cover) => {
                 if let Ok(cover) = cover {
                     self.selected_manga.as_mut().unwrap().cover_image = Some(cover);
                 }
+                Task::perform(
+                    load_manga(self.selected_manga.as_ref().unwrap().id.clone()),
+                    Message::MangaChaptersLoaded,
+                )
+            }
+            Message::MangaChaptersLoaded(result) => {
+                if let Ok(result) = result {
+                    self.volumes = result;
+                }
+
                 Task::none()
             }
             Message::Back => {
@@ -155,7 +259,7 @@ impl App {
                 if let Ok(results) = results {
                     self.results = results;
                 } else {
-                    eprintln!("{results:#?}");
+                    eprintln!("Search Error: {results:#?}");
                 }
                 Task::none()
             }
@@ -163,6 +267,56 @@ impl App {
                 if let (Ok(h), Some(item)) = (handle, self.results.get_mut(index)) {
                     item.cover_image = Some(h);
                 }
+                Task::none()
+            }
+            Message::ChapterClicked {
+                id,
+                volume,
+                chapter,
+            } => Task::perform(
+                download_manga(id, volume, chapter),
+                Message::MangaDownloaded,
+            ),
+            Message::MangaDownloaded(result) => {
+                match result {
+                    Ok((manga, (volume, chapter))) => {
+                        let total_to_download = manga.chapter.data.len();
+                        self.active_download = Some(Download {
+                            base_url: manga.base_url,
+                            hash: manga.chapter.hash,
+                            volume,
+                            chapter,
+                            images: manga.chapter.data,
+                            downloaded: 0,
+                            total_to_download,
+                            downloaded_images: HashMap::new(),
+                        });
+                    }
+                    Err(err) => {
+                        eprintln!("{err:?}")
+                    }
+                }
+
+                Task::none()
+            }
+            Message::ImageDownloaded(result) => {
+                let img = result.expect("Failed to download image");
+                if let Some(download) = self.active_download.as_mut() {
+                    download.downloaded_images.insert(img.name.to_owned(), img);
+                    download.downloaded += 1;
+                    if download.downloaded == download.total_to_download {
+                        self.write_manga();
+
+                        self.active_download = None;
+                    }
+                } else {
+                    unreachable!();
+                }
+
+                Task::none()
+            }
+            Message::DownloadError(error) => {
+                eprintln!("{error:?}");
                 Task::none()
             }
             _ => Task::none(),
@@ -182,7 +336,7 @@ impl App {
             .iter()
             .map(|list_item| {
                 let thumb: Element<'_, Message> = if let Some(handle) = &list_item.cover_image {
-                    widget::image(handle.clone())
+                    container(widget::image(handle.clone()))
                         .width(IMAGE_WIDTH)
                         .height(IMAGE_HEIGHT)
                         .into()
@@ -198,13 +352,7 @@ impl App {
                 };
                 button(row![thumb, column![text(&list_item.title)]])
                     .width(Length::Fill)
-                    .on_press(Message::MangaSelected(MangaListItem {
-                        id: list_item.id.clone(),
-                        title: list_item.title.clone(),
-                        cover_url: list_item.cover_url.clone(),
-                        description: list_item.description.clone(),
-                        cover_image: None, // Leave blank so we can load the full one later
-                    }))
+                    .on_press(Message::MangaSelected(list_item.clone()))
                     .into()
             })
             .collect();
@@ -232,8 +380,63 @@ impl App {
         let cover: Element<'_, Message> = selected_manga
             .cover_image
             .as_ref()
-            .and_then(|cover_image| Some(widget::image(cover_image).width(256).into()))
-            .unwrap_or(container("").width(256).into());
+            .and_then(|cover_image| Some(widget::image(cover_image).width(256).height(360).into()))
+            .unwrap_or(
+                container(center(text("Loading")))
+                    .width(256)
+                    .height(360)
+                    .style(|_| container::Style {
+                        background: Some(Color::from_rgb(0.2, 0.2, 0.2).into()),
+                        ..Default::default()
+                    })
+                    .into(),
+            );
+
+        let volumes: Vec<Element<'_, Message>> = self
+            .volumes
+            .iter()
+            .map(|volume| {
+                let header: Element<'_, Message> =
+                    container(text(format!("Volume {}", volume.name)))
+                        .padding(4)
+                        .width(Length::Fill)
+                        .style(|_| container::Style {
+                            background: Some(Background::Color(Theme::Dark.palette().success)),
+                            ..Default::default()
+                        })
+                        .into();
+
+                let chapters: Vec<Element<'_, Message>> = volume
+                    .chapters
+                    .iter()
+                    .map(|chapter| {
+                        button(text(format!("Chapter {}", chapter.name)))
+                            .width(Length::Fill)
+                            .on_press_with(|| Message::ChapterClicked {
+                                id: chapter.id.clone(),
+                                volume: chapter.volume.clone(),
+                                chapter: chapter.chapter.clone(),
+                            })
+                            .style(|a, b| button::Style {
+                                background: match b {
+                                    Status::Hovered => {
+                                        Some(Background::Color(Theme::Dark.palette().primary))
+                                    }
+                                    _ => None,
+                                },
+                                text_color: Color::WHITE,
+                                ..Default::default()
+                            })
+                            .into()
+                    })
+                    .collect();
+
+                let mut elements: Vec<Element<'_, Message>> = vec![header];
+                elements.extend(chapters);
+
+                Column::with_children(elements).into()
+            })
+            .collect();
 
         let content = scrollable(column![row![
             column![
@@ -243,20 +446,82 @@ impl App {
                     .align_x(Horizontal::Center),
             ]
             .padding(20),
-            column![text(&selected_manga.description)].padding(Padding::new(20.0).left(0))
+            column![
+                text(&selected_manga.description),
+                Column::with_children(volumes),
+            ]
+            .padding(Padding::new(20.0).left(0)),
         ]]);
 
-        container(column![
-            row![
-                button("Back").on_press(Message::Back),
-                horizontal_space(),
-                button("Settings")
-            ]
-            .padding(8),
-            content,
-        ])
-        .padding(4)
+        let modal: Element<'_, Message> = if let Some(download) = &self.active_download {
+            container(opaque(mouse_area(
+                center(opaque(
+                    card(
+                        text("Downloading"),
+                        progress_bar(
+                            0.0..=download.total_to_download as f32,
+                            download.downloaded as f32,
+                        ),
+                    )
+                    .width(300),
+                ))
+                .style(|_| container::Style {
+                    background: Some(
+                        Color {
+                            a: 0.8,
+                            ..Color::BLACK
+                        }
+                        .into(),
+                    ),
+                    ..Default::default()
+                }),
+            )))
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
+        } else {
+            column![].into()
+        };
+
+        stack![
+            container(column![
+                row![
+                    button("Back").on_press(Message::Back),
+                    horizontal_space(),
+                    button("Settings")
+                ]
+                .padding(8),
+                content,
+            ])
+            .padding(4),
+            modal
+        ]
         .into()
+    }
+
+    fn write_manga(&mut self) {
+        if let Some(active_download) = self.active_download.as_mut() {
+            let title = self.selected_manga.as_ref().unwrap().title.clone();
+
+            let mut html = "<html><head></head><body>".to_owned();
+            let mut writer = MobiWriter::new(title.clone());
+            for (i, k) in active_download.images.drain(..).enumerate() {
+                let download_image = active_download
+                    .downloaded_images
+                    .remove(&k)
+                    .expect("Failed to find image");
+                writer.add_image(download_image.bytes);
+                html += format!("<p height=\"0pt\" width=\"0pt\" align=\"center\"><img recindex=\"{:05}\" align=\"baseline\" width=\"{}\" height=\"{}\"></img></p><mbp:pagebreak/>", i+1, download_image.width, download_image.height).as_str();
+            }
+
+            html += "</body></html>";
+            writer.set_content(html);
+            std::fs::write(
+                format!("{}.{}.{}.mobi", title, active_download.volume, active_download.chapter),
+                writer.to_bytes().expect("Failed to write"),
+            )
+            .expect("Failed to save");
+        }
     }
 }
 
@@ -265,7 +530,6 @@ async fn do_search(search: String) -> Result<Vec<MangaListItem>, Error> {
         "https://api.mangadex.org/manga?title={}&includes[]=cover_art",
         search,
     );
-    eprintln!("Fetching {}", url);
     let response = get_client()
         .get(url)
         .send()
@@ -301,10 +565,136 @@ async fn do_search(search: String) -> Result<Vec<MangaListItem>, Error> {
     Ok(results)
 }
 
-async fn load_manga(id: String) -> Result<Vec<String>, Error> {
+async fn load_manga(id: String) -> Result<Vec<Volume>, Error> {
     // Load Chapters
+    let url = format!(
+        "https://api.mangadex.org/manga/{}/aggregate?translatedLanguage[]=en",
+        id,
+    );
+    let response = get_client()
+        .get(url)
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
 
-    Ok(vec![])
+    let volumes = response
+        .get("volumes")
+        .unwrap()
+        .as_object()
+        .ok_or(Error::GenericError("Failed to fetch volumes".to_owned()))?
+        .iter()
+        .rev()
+        .map(|(vk, v)| Volume {
+            name: vk.to_owned(),
+            chapters: v
+                .get("chapters")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .iter()
+                .rev()
+                .map(|(ck, v)| Chapter {
+                    id: v.get("id").unwrap().as_str().unwrap().to_owned(),
+                    volume: vk.to_owned(),
+                    chapter: ck.to_owned(),
+                    name: ck.to_owned(),
+                })
+                .collect::<Vec<_>>(),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(volumes)
+}
+
+async fn download_manga(
+    id: String,
+    volume: String,
+    chapter: String,
+) -> Result<(MangaChapterResponse, (String, String)), Error> {
+    let client = get_client();
+
+    let response = client
+        .get(format!("https://api.mangadex.org/at-home/server/{id}"))
+        .send()
+        .await?
+        .json::<MangaChapterResponse>()
+        .await?;
+
+    Ok((response, (volume, chapter)))
+}
+
+fn download_manga_images(download: &Download) -> Subscription<Message> {
+    let client = get_client();
+
+    let base_url = download.base_url.to_owned();
+    let hash = download.hash.to_owned();
+    let data = download.images.to_owned();
+
+    let downloads = stream::iter(data.clone())
+        .map(move |file| {
+            let base_url = base_url.clone();
+            let hash = hash.clone();
+            let file = file.clone();
+            let client = client.clone();
+
+            async move {
+                match client
+                    .get(format!("{}/data/{}/{}", base_url, hash, file))
+                    .send()
+                    .await
+                {
+                    Ok(response) => {
+                        let result: Result<DownloadImage, Error> = response
+                            .bytes()
+                            .await
+                            .map_err(Into::into)
+                            .and_then(|bytes| image::load_from_memory(&bytes).map_err(Into::into))
+                            .and_then(|image| {
+                                let mut bytes = Cursor::new(Vec::new());
+                                let (width, height) = get_adjusted_size(&image);
+                                match image
+                                    .grayscale()
+                                    .resize(width, height, FilterType::Lanczos3)
+                                    .write_to(&mut bytes, ImageFormat::Jpeg)
+                                {
+                                    Ok(()) => Ok(DownloadImage {
+                                        name: file,
+                                        width,
+                                        height,
+                                        bytes: bytes.into_inner(),
+                                    }),
+                                    Err(e) => Err(e.into()),
+                                }
+                            });
+
+                        Message::ImageDownloaded(result)
+                        // std::fs::write(download_dir.join(file), response.bytes().await.unwrap())
+                        //     .expect("Failed to write downloaded file");
+                    }
+                    Err(err) => Message::DownloadError(Error::from(err)),
+                }
+            }
+        })
+        .buffer_unordered(4);
+
+    Subscription::run_with_id(download.hash.to_owned(), downloads)
+}
+
+fn get_adjusted_size(img: &DynamicImage) -> (u32, u32) {
+    let (width, height) = img.dimensions();
+    let max_width = 600;
+    let max_height = 800;
+
+    let scale_w = max_width as f32 / width as f32;
+    let scale_h = max_height as f32 / height as f32;
+
+    let scale = scale_w.min(scale_h);
+
+    let new_width = (width as f32 * scale).round() as u32;
+    let new_height = (height as f32 * scale).round() as u32;
+
+    (new_width, new_height)
 }
 
 fn get_cover_from_relationship(relationship: &serde_json::Value) -> Option<String> {
@@ -345,15 +735,7 @@ fn get_client() -> Client {
 }
 
 async fn fetch_image(url: String) -> Result<Handle, Error> {
-    let bytes = reqwest::ClientBuilder::new()
-        .user_agent("manga2kindle")
-        .build()
-        .unwrap()
-        .get(url)
-        .send()
-        .await?
-        .bytes()
-        .await?;
+    let bytes = get_client().get(url).send().await?.bytes().await?;
 
     Ok(Handle::from_bytes(bytes))
 }
