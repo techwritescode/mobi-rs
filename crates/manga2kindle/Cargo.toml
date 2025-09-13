@@ -13,3 +13,4 @@ iced_aw = { version = "0.12.2" }
 tokio = "1.47.1"
 sysinfo = "0.37.0"
 mobi = { path = "../mobi" }
+anyhow = "1.0.98"

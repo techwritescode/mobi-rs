@@ -2574,6 +2574,7 @@ dependencies = [
 name = "manga2kindle"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "iced",
  "iced_aw",
  "image 0.25.8",

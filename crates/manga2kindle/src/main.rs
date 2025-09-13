@@ -1,12 +1,12 @@
 use iced::alignment::Horizontal;
-use iced::futures::{stream, StreamExt};
+use iced::futures::{StreamExt, stream};
 use iced::widget::button::Status;
 use iced::widget::image::Handle;
 use iced::widget::{
-    button, center, column, container, horizontal_space, mouse_area, opaque, progress_bar, row,
-    scrollable, stack, text, text_input, Column,
+    Column, button, center, column, container, horizontal_space, mouse_area, opaque, progress_bar,
+    row, scrollable, stack, text, text_input,
 };
-use iced::{widget, Background, Color, Element, Length, Padding, Subscription, Task, Theme};
+use iced::{Background, Color, Element, Length, Padding, Subscription, Task, Theme, widget};
 use iced_aw::card;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageFormat};
@@ -305,7 +305,7 @@ impl App {
                     download.downloaded_images.insert(img.name.to_owned(), img);
                     download.downloaded += 1;
                     if download.downloaded == download.total_to_download {
-                        self.write_manga();
+                        self.write_manga().expect("Failed to save manga");
 
                         self.active_download = None;
                     }
@@ -351,6 +351,16 @@ impl App {
                         .into()
                 };
                 button(row![thumb, column![text(&list_item.title)]])
+                    .style(|a, b| button::Style {
+                        background: match b {
+                            Status::Hovered => {
+                                Some(Background::Color(Theme::Dark.palette().primary))
+                            }
+                            _ => None,
+                        },
+                        text_color: Color::WHITE,
+                        ..Default::default()
+                    })
                     .width(Length::Fill)
                     .on_press(Message::MangaSelected(list_item.clone()))
                     .into()
@@ -499,29 +509,54 @@ impl App {
         .into()
     }
 
-    fn write_manga(&mut self) {
+    fn write_manga(&mut self) -> Result<(), Error> {
         if let Some(active_download) = self.active_download.as_mut() {
-            let title = self.selected_manga.as_ref().unwrap().title.clone();
+            let selected_manga = self.selected_manga.as_ref().unwrap();
+            let title = selected_manga.title.clone();
+            let cover_image = selected_manga
+                .cover_image
+                .clone()
+                .ok_or(Error::GenericError("No cover image".to_owned()))?;
 
             let mut html = "<html><head></head><body>".to_owned();
             let mut writer = MobiWriter::new(title.clone());
+            writer.add_image(make_cover(cover_image)?);
             for (i, k) in active_download.images.drain(..).enumerate() {
                 let download_image = active_download
                     .downloaded_images
                     .remove(&k)
                     .expect("Failed to find image");
                 writer.add_image(download_image.bytes);
-                html += format!("<p height=\"0pt\" width=\"0pt\" align=\"center\"><img recindex=\"{:05}\" align=\"baseline\" width=\"{}\" height=\"{}\"></img></p><mbp:pagebreak/>", i+1, download_image.width, download_image.height).as_str();
+                html += format!("<p height=\"0pt\" width=\"0pt\" align=\"center\"><img recindex=\"{:05}\" align=\"baseline\" width=\"{}\" height=\"{}\"></img></p><mbp:pagebreak/>", i+2, download_image.width, download_image.height).as_str();
             }
 
             html += "</body></html>";
             writer.set_content(html);
             std::fs::write(
-                format!("{}.{}.{}.mobi", title, active_download.volume, active_download.chapter),
-                writer.to_bytes().expect("Failed to write"),
-            )
-            .expect("Failed to save");
+                format!(
+                    "{}.{}.{}.mobi",
+                    title, active_download.volume, active_download.chapter
+                ),
+                writer.to_bytes()?,
+            )?;
+
+            Ok(())
+        } else {
+            unreachable!()
         }
+    }
+}
+
+fn make_cover(image: Handle) -> Result<Vec<u8>, Error> {
+    if let Handle::Bytes(_, img_bytes) = image {
+        let mut bytes = Cursor::new(Vec::new());
+        image::load_from_memory(&img_bytes)?
+            .grayscale()
+            .write_to(&mut bytes, ImageFormat::Jpeg)?;
+
+        Ok(bytes.into_inner())
+    } else {
+        unreachable!()
     }
 }
 
@@ -683,8 +718,8 @@ fn download_manga_images(download: &Download) -> Subscription<Message> {
 
 fn get_adjusted_size(img: &DynamicImage) -> (u32, u32) {
     let (width, height) = img.dimensions();
-    let max_width = 600;
-    let max_height = 800;
+    let max_width = 700;
+    let max_height = 900;
 
     let scale_w = max_width as f32 / width as f32;
     let scale_h = max_height as f32 / height as f32;
@@ -761,5 +796,11 @@ impl From<std::io::Error> for Error {
 impl From<image::ImageError> for Error {
     fn from(err: image::ImageError) -> Error {
         Error::ImageFailed(Arc::new(err))
+    }
+}
+
+impl From<anyhow::Error> for Error {
+    fn from(value: anyhow::Error) -> Self {
+        Error::GenericError(value.to_string())
     }
 }
